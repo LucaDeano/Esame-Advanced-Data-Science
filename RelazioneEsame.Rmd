@@ -1,0 +1,1121 @@
+---
+title: "Progetto di Advanced Data Science"
+subtitle: "Dataset email-Eu-core network"
+author: "Deano Luca - Matricola 159357"
+date: "2026-01-09"
+output: 
+  html_document:
+    toc: true             # Abilita l'indice (Table of Contents)
+    toc_float:            # Rende l'indice flottante a sinistra
+      collapsed: false    # L'indice rimane sempre aperto
+      smooth_scroll: true # Scorrimento fluido quando clicchi
+    number_sections: true # Numera automaticamente i capitoli (1, 1.1, 2...)
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+```{r}
+library(dplyr)
+library(tidyverse)
+library(ggplot2)
+library(tidygraph)
+library(igraph)
+library(ggraph)
+library(patchwork)
+library(ggrepel)
+library(ggrepel)
+library(scales)
+library(tidytext)
+library(corrplot)
+library(poweRlaw)
+```
+
+
+# Introduzione
+
+## Informazioni sul Dataset
+
+Per la realizzazione del progetto di Advanced Data Science ho deciso di scegliere un dataset relativo ad uno scambio di email.
+
+Più precisamente, quest'ultimo contiene informazioni anonime che riguardano tutta la posta elettronica in entrata e in uscita tra i soli membri di un istituto di ricerca (il dataset non contiene messaggi in ingresso o in uscita verso il resto del mondo).
+
+* Un arco $(x,y)$ è presente nella rete se la persona $x$ ha inviato almeno una email alla persona $y$.
+
+L'istituto di ricerca è composto da 42 diversi dipartimenti e ogni persona presente nell'istituto fa esattamente parte di un dipartimento.
+
+
+## Caricamento e modifiche Dataset
+
+```{r}
+#Carico i dataset
+nodi = read_table("email-Eu-core-department-labels.txt", col_names = FALSE)
+archi = read_table("email-Eu-core.txt", col_names = FALSE)
+
+#Rinomino le colonne
+colnames(nodi) = c("id", "dip")
+colnames(archi) = c("from", "to")
+```
+
+
+Visto che l'attributo id dei nodi partiva da 0 (come anche i dipartimenti dip), la creazione del grafo portava ad errore. Questo perchè un indice numerico con valore 0, viene interpretato come un indice non valido dalla libreria tidygraph perchè gli indici in R partono da 1.
+
+Per ovviare a questo problema ho deciso di aumentare di 1 tutti gli indici presenti sia nel dataset dei nodi che in quello degli archi in modo uniforme. Grazie a ciò sono riuscito a creare il grafo senza alcun tipo di problema o errori.
+
+```{r}
+nodi = nodi %>%
+  mutate(id = id + 1,
+         dip = dip + 1)
+
+archi = archi %>%
+  mutate(from = from + 1,
+         to = to + 1)
+```
+
+
+```{r}
+# Costruzione del grafo
+g = tbl_graph(nodes = nodi, edges = archi, directed = TRUE)
+```
+
+# Visualizzazione grafo originale
+
+```{r, fig.width = 10, fig.height = 10, dpi = 300}
+g_vis = g %>%
+  activate(nodes) %>%
+  mutate(dip = as.factor(dip))
+
+ggraph(g_vis, layout = "fr") +
+  # Archi molto sottili e chiari
+  geom_edge_link(alpha = 0.05, color = "gray70", width = 0.1) +
+  
+  # Nodi colorati per dipartimento
+  geom_node_point(aes(color = dip), size = 1.5, alpha = 0.8) +
+  
+  # padelle che supporta molti colori
+  scale_color_viridis_d(option = "turbo") + 
+  
+  theme_graph() +
+  theme(
+    legend.position = "none",
+  ) +
+  labs(
+    title = "Rete delle comunicazioni dell'istituto",
+    subtitle = "I nodi sono colorati in base al dipartimento di appartenenza"
+  )
+```
+
+
+# Prime analisi
+
+Visto che da una prima e rapida visualizzazione sembra che alcuni nodi siano isoltati dal resto della rete, cerchiamo effettivamente di capire quanti e quali sono i nodi che non hanno mai inviato e ricevuto email ad altre persone.
+
+```{r}
+g = g %>%
+  activate(nodes) %>%
+  mutate(
+    grado_totale = centrality_degree(mode = "total"),
+    grado_in = centrality_degree(mode = "in"),
+    grado_out = centrality_degree(mode = "out")
+  )
+
+nodi_grado = g %>% 
+  activate(nodes) %>% 
+  as_tibble()
+```
+
+
+Controllando la tabella scopriamo che nessun nodo ha grado_totale 0, ma non per questo quei nodi non sono isolati. Infatti nella descrizione del dataset viene specificata la presenza dei self-loops, ovvero persone che inviano email a se stesse (magari come dei promemoria). Cerchiamo di individuare questi nodi.
+
+```{r}
+#prendo id dei nodi che hanno solamente un arco che punta verso loro stessi
+nodi_self = V(g)$id[degree(g, mode = "all", loops = FALSE) == 0]
+print(nodi_self)
+```
+
+
+Ora che li abbiamo individuati, facciamo un ulteriore confronto. Calcolo le componenti connesse:
+
+```{r}
+comp = components(g, mode = "weak")
+
+table(comp$csize)
+```
+
+
+Dall'analisi delle componenti infatti scopriamo che esiste una componente gigante composta da 986 nodi e 19 componenti da 1 singolo nodo. Adesso verifichiamo se questi 19 nodi corrispondono a quelli identificati prima con solo self_loops attraverso la funzione identical.
+
+```{r}
+#prendo i nodi che non fanno parte della componente gigante
+comp_isolati = V(g)$id[comp$membership != 1]
+identical(nodi_self, comp_isolati)
+```
+
+
+Come previsto, le due liste coincidono.
+
+Adesso proviamo a creare la stessa visualizzazione di prima, ma questa volta togliamo i nodi "isolati" che come unica comunicazione era un invio di e-mail a se stessi.
+
+
+```{r, fig.width = 10, fig.height = 10, dpi = 300}
+
+#tolgo i nodi "isolati"
+g_noSelf = delete_vertices(g, V(g)[degree(g, mode = "all", loops = FALSE) == 0])
+
+g_noSelf = as_tbl_graph(g_noSelf)
+
+#prendi i 5 dipartimenti con più nodi al loro interno
+top5_dip = g_noSelf %>%
+  activate(nodes) %>%
+  as_tibble() %>%
+  count(dip, sort = TRUE) %>%
+  top_n(5, n) %>%
+  pull(dip)
+
+g_vis1 = g_noSelf %>%
+  activate(nodes) %>%
+  mutate(dip = as.factor(dip))
+
+ggraph(g_vis1, layout = "fr") +
+  geom_edge_link(alpha = 0.2, color = "gray70", width = 0.1) +
+  
+  geom_node_point(aes(color = dip), size = 2, alpha = 0.8) +
+  
+  scale_color_viridis_d(
+    option = "turbo",
+    breaks = top5_dip, # Mostra solo i top 5 nella legenda
+    name = "Top 5 dipartimenti"
+  ) +
+  
+  theme_graph() +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(face = "bold"),
+    legend.text = element_text(size = 8)
+  ) +
+  labs(
+    title = "Rete dell'istituto senza i nodi con solo self-loops",
+    subtitle = "I colori sono i dipartimenti, la legenda si focalizza sui primi 5"
+  )
+```
+
+## Transitività e Avarage Path Length
+
+```{r}
+transit_globale = transitivity(g, type = "global")
+
+print(paste("Transitività globale:", round(transit_globale, 4)))
+```
+
+
+Il valore di transitività globale è moderato. Non tutti parlano con tutti ma c'è un'ottima base di collaborazione tra le persone dell'istituto. Inoltre questo valore ci dice che la rete non è casuale ma sono comunque presenti gruppo di comunicazione (grazie alla divisione in dipartimenti dove all'interno di ogni dipartimento la comunicazione sarà maggiore).
+
+Se andiamo nel dettaglio ad analizzare i diversi valori di transitività locale per ogni dipartimento:
+
+```{r}
+dipartimenti = unique(V(g)$dip)
+
+calcolo_transitività = function(d) {
+  #prendo i nodi di un dipartimento
+  nodes_dip = V(g)[dip == d]
+  
+  #creo il grafo con i solo nodi di quel dipartimento
+  g_dip = induced_subgraph(g, nodes_dip)
+  
+  #ritorno NA se non ci sono archi
+  if (ecount(g_dip) == 0) return(NA)
+  
+  #calcolo  
+  transitivity(g_dip, type = "global")
+}
+
+#applico la funzione per ogni dipartimento
+tr_dip = sapply(dipartimenti, calcolo_transitività)
+
+transitivita_dip = data.frame(
+  dip = dipartimenti,
+  transitività = tr_dip
+) %>%
+  filter(
+    !is.na(transitività)
+  ) %>%
+  arrange(-transitività)
+
+print(transitivita_dip)
+```
+
+Si vede appunto che i valori sono molto grandi. Questo perchè all'interno di ogni dipartimento si tende a parlare con tutti e come vedremo più avanti anche la densità di ogni dipartimento è molto elevata.
+
+
+```{r}
+giant_component = induced_subgraph(g, V(g)[comp$membership == which.max(comp$csize)])
+avg_path = mean_distance(giant_component, directed = TRUE)
+
+print(paste("Lunghezza media del cammino (componente gigante):", round(avg_path, 4)))
+```
+
+
+Il valore che fa riferimento alla lunghezza media del cammino per quanto riguarda la componente gigante ha un indicazione importante. In media bastano meno di 3 passaggi per collegare due nodi qualsiasi della componente gigante. Sappiamo che all'interno di una rete di questo tipo dove gli archi rappresentano scambi di informazioni (e-mail), un fattore importante è la velocità con cui fluiscono le informazioni, pertanto è normale che la lunghezza media sia così ottima.
+
+
+
+## Distribuzione dei gradi
+
+```{r}
+#grafico distribuzione grado_totale
+p1 = ggplot(nodi_grado, aes(x = grado_totale)) +
+      geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+      theme_minimal() +
+      labs(title = "Grado totale",
+        x = "", y = "Frequenza")
+
+#grafico distribuzione grado_in
+p2 = ggplot(nodi_grado, aes(x = grado_in)) +
+      geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+      theme_minimal() +
+      labs(title = "In-Degree",
+        x = "", y = "")
+
+#grafico distribuzione grado_out
+p3 = ggplot(nodi_grado, aes(x = grado_out)) +
+      geom_histogram(bins = 30, fill = "steelblue", color = "white") +
+      theme_minimal() +
+      labs(title = "Out-Degree",
+        x = "", y = "")
+
+#plot dei tre grafici accanto
+p1 + p2 + p3
+```
+
+
+```{r}
+d = degree(g)
+m = displ$new(d)
+
+est = estimate_xmin(m)
+m$setXmin(est)
+#Grado minimo di partenza per sitma della power-law
+print(paste("La soglia minima trovata ottimale è: ", m$xmin))
+
+#stimo i parametri della distribuzione usando come xmin quello stimato sopra
+est_pars = estimate_pars(m)
+m$setPars(est_pars)
+#Stima del valore alpha
+print(paste("L'esponente della power-law (alpha) è di: ", round(m$pars, 4)))
+```
+
+
+```{r}
+ccdf = function(d) {
+  n = length(d)
+  max = max(d)
+  p = rep(0, max)
+  for (i in 1:length(p)) {
+    p[i] = length(d[d >= i]) / n
+  }
+  return(p)
+}
+
+# Calcola i gradi del tuo grafo
+d = degree(g)
+p = ccdf(d)
+
+plot(73:max(d), p[73:length(p)], log="xy", type = "l", 
+     xlab="Degree", ylab="CCDF",
+     main="Verifica Power Law")
+```
+
+La distribuzione dei gradi mostra una compatibilità con la power-law, avendo un valore dell'espondente (alpha) di 2.97. Però negli ultimi punti la curva cala bruscamente anche per i pochi dati a disposizione nella coda. Il grafico non contraddice la stima power-law, ma non è una perfetta, non ne segue completamente il comportamento.
+
+
+## Verifica Small-World
+
+```{r}
+diameter(g)
+```
+
+
+```{r}
+#calcolo distribuzione delle distanze
+paths = distance_table(g)$res
+names(paths) = 1:length(paths)
+barplot(paths / sum(paths), xlab="Distance", ylab="Frequency")
+```
+
+
+```{r}
+real_clustering = transitivity(g, type = "global")
+real_avg_path = average.path.length(g, directed = TRUE)
+
+#creo 100 grafi diversi casuali con stessi parametri della mia rete
+set.seed(123)
+sim_results = replicate(100, {
+  # Crea grafo casuale
+  g_rand = sample_gnm(n = vcount(g), m = ecount(g), directed = TRUE)
+  
+  # Calcola metriche di clustering e lunghezza media
+  c(
+    C_rand = transitivity(g_rand, type = "global"),
+    L_rand = mean_distance(g_rand, directed = TRUE)
+  )
+})
+
+#faccio una media dei valori dei 100 grafi casuali
+rand_clustering = mean(sim_results["C_rand",], na.rm = TRUE)
+rand_avg_path = mean(sim_results["L_rand",], na.rm = TRUE)
+
+# Gamma, Ho più cluster dei grafi casuali?
+gamma = real_clustering / rand_clustering
+
+# I cammini medi sono più corti rispetto al modello casuale?
+lambda = real_avg_path / rand_avg_path
+
+# Sigma, indice per classificazione se small world o meno
+sigma = gamma / lambda
+
+print(paste("Valore di Gamma: ", round(gamma, 4)))
+print(paste("Valore di Lambda: ", round(lambda, 4)))
+print(paste("Valore di Sigma: ", round(sigma, 4)))
+
+print(paste("Clustering reale: ", round(real_clustering, 4), "Clustering random: ", round(rand_clustering ,4)))
+print(paste("Cammino medio reale: ", round(real_avg_path, 4), "Clustering medio random: ", round(rand_avg_path, 4)))
+```
+
+Confrontare la mia rete con una serie di grafi casuali con stesso numero di archi e nodi mi ha permesso di capire se la mia rete è classificabile come Small World o meno.
+
+Un valore di gamma molto maggiore a 1 è indice di presenza di cluster locali molto connessi. I vicini tra di loro tendono ad essere molto connessi.
+
+Con Lambda so che la lunghezza media dei cammini nella mia rete è leggermente superiore a quella media delle reti casuali. L'informazione viaggia molto velocemente.
+
+Sigma con una valore molto maggiore di 1 è l'ultimo segnale che mi serviva per confermare che la mia rete viene classificata come rete **Small World**: Ho un coefficiente di clustering molto alto ma posso raggiungere comunque tutta la rete con pochi passi.
+
+
+## Analisi di resilienza
+
+```{r}
+percolate = function(g, size, d) {
+  
+  giant = vector()
+  
+  c = components(g)
+  giant[1] = max(c$csize)
+  
+  names(d) = 1:length(d)
+  d = sort(d, decreasing=TRUE)
+  vital = as.integer(names(d[1:size]))
+  
+  for (i in 1:size) {
+    c = components(delete_vertices(g, vital[1:i]))
+    giant[i+1] = max(c$csize)
+  }
+  
+  return(giant)
+  
+}
+```
+
+```{r}
+# resilience
+size = vcount(g_noSelf)
+# random
+rand = percolate(g_noSelf, size, d = sample(V(g_noSelf), size))    
+# degree
+deg = percolate(g_noSelf, size, d = degree(g_noSelf))    
+# pagerank
+pr = percolate(g_noSelf, size, d=page_rank(g_noSelf)$vector)    
+# betweenness
+bet = percolate(g_noSelf, size, d = betweenness(g_noSelf))  
+# eginenvector
+ev = percolate(g_noSelf, size, d = eigen_centrality(g_noSelf)$vector)
+```
+
+```{r}
+#metto la scala in percentuale
+N = vcount(g_noSelf)
+x_frac = (0:size) / N
+
+plot(x_frac, deg, type = "l", col=1, 
+     xlab="Frazione di nodi rimossi", 
+     ylab="Grandezza componente gigante",
+     xlim = c(0, 1))
+lines(x_frac, pr, col=2)
+lines(x_frac, bet, col=3)
+lines(x_frac, rand, col=4)
+lines(x_frac, ev, col=5)
+lines(0:size, rep(vcount(g)/2, size+1), lty=2)
+legend(x = "bottomleft", 
+       legend = c("degree", "pageRank", "btw", "random", "egien"), lty = 1, col = 1:5)
+```
+
+Il grafico mostra come la rete sia resiliente ai guasti. Rimuovere nodi in modo casuale è la strategia peggiore. Se invece cominciamo ad attaccare la rete in modo mirato risulta molto sensibile. La presenza di hub molto importanti è un fattore chiave negli attacchi per grado; inoltre la presenza di possibili direttori (come vedremo più avanti) o di nodi che fungono da comunicatori (ponti) per i diversi dipartimenti rende gli attacchi per betweennes molto efficaci.
+
+Grazie a queste indicazioni possiamo definire la nostra rete Scale free visto che è robusta per gli attacchi casuali ma fragile a gli attacchi mirati.
+
+
+# Comunicazione all'interno dell'istituto
+
+Come avviene la comunicazione all'interno dell'istututo? è prevalentemente unidirezionale o c'è un dialogo tra due persone? Posso pensare ad una struttura gerarchica? Queste sono le prime domande che mi sono posto dopo la scelta del dataset.
+
+Per prima cosa, vado a creare un grafico che mi permette di visualizzare, per ogni nodo, In-Degree e Out-Degree. Nodi che sono presenti sopra la linea sono quelli che ricevono più e-mail di quante ne inviano, mentre quelli sotto sono nodi molto attivi e che inviano molte e-mail ma sono poco considerati e a cui arrivano poche e-mail.
+
+```{r}
+ggplot(nodi_grado, aes(x = grado_out, y = grado_in)) +
+  geom_point(aes(color = as.factor(dip)), alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "In-Degree vs Out-Degree",
+       subtitle = "Confronto con simmetria di comunicazione",
+       x = "Out-Degree", y = "In-Degree")
+```
+
+
+Dalla visualizzazione la prima cosa evidente è che i punti sono allineati lungo la diagonale. Di conseguenza la comunicazione non è casuale e la maggior parte dei nodi è attiva in entrambe le direzioni.
+
+I nodi invece che si distaccano dalla retta $x=y$ suggeriscono che queste persone abbiamo ruoli diversi dalla maggior parte delle persone: quelli sopra la retta sono per lo più ricettivi e magari fanno riferimento a figure come quella di "capo dipartimento"; punti sotto la retta invece agiscono come diffusori di informazioni e magari fanno capo a persone col compito di inviare notifiche a tutti o avvisi.
+
+
+Per avere una misura più specifica e globale uso la metrica di reciprocità. Questa misura la probabilità che, se esiste un arco da $a$ a $b$, esiste anche il suo reciproco (ovvero un arco da $b$ ad $a$).
+
+* Un valore vicino a 1 indica una comunicazione completamente bi-direzionale
+* Un valore vicino a 0 è indice invece di una comunicazione gerarchica, uni-direzionale
+
+
+
+```{r}
+rec_value = reciprocity(g, ignore.loops = TRUE)
+print(paste("Reciprocità della rete:", rec_value))
+```
+
+
+Questo valore ci dice che se $a$ ha inviato un e-mail a $b$ c'è il $71,1$% di possibilità che anche $b$ abbia inviato almeno un e-mail ad $a$.
+
+Confrontando questo risultato con lo scatterplot precedente ipotizzo la presenza di pochi nodi dal comportamento "non standard" e il resto del gruppo che si comporta in modo paritario. è probabile che all'interno dei vari dipartimenti la comunicazione sia quasi del tutto bi-direzionale e questo alza di molto la media di 0.7 calcolata sopra.
+
+## Comunicazione al'interno dei dipartimenti
+
+Ora cerchiamo di capire se l'ipotesi fatta sulla comunicazione all'interno dei singoli dipartimenti sia corretta o meno. Per farlo, definisco una funzione calcolo_reciprocità che mi permette di realizzare sotto-grafi in cui tengono conto (grazie a induced_subgraph) solo dei nodi che appartengono ad un determinato dipartimento e gli archi che hanno entrambi gli estremi sempre in quest'ultimo.
+
+```{r}
+dipartimenti = unique(V(g)$dip)
+
+calcolo_reciprocità = function(d) {
+  nodes_dip = V(g)[dip == d]
+  g_dip = induced_subgraph(g, nodes_dip)
+  if (ecount(g_dip) == 0) return(NA)
+  reciprocity(g_dip, ignore.loops = TRUE)
+}
+
+rec_dip = sapply(dipartimenti, calcolo_reciprocità)
+
+recipr_dip = data.frame(
+  dip = dipartimenti,
+  reciprocità = rec_dip
+)
+```
+
+
+Adesso vado a visualizzare in maniera chiara il valore di reciprocità per dipartimento e ordiniamo il tutto in ordine decrescente per avere maggior ordine e capire subito quali sono i dipartimenti con la maggior comunicazione orizzontale all'interno della rete.
+
+```{r}
+ggplot(recipr_dip, aes(x = reorder(as.factor(dip), -reciprocità), y = reciprocità)) +
+  geom_col(fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Reciprocità per dipartimento",
+       subtitle = "Ordinati in modo decrescente",
+       x = "Dipartimento",
+       y = "Reciprocità")
+```
+
+
+Vedendo solamente questo grafico si nota che nel dipartimento 26 tutti i nodi comunichino in maniera "dialogativa", mentre per quanto riguarda la maggior parte dei dipartimenti rimanenti riscontriamo un valore di reciprocità che supera la media globale vista precedentemente.
+
+Per andare maggiormente nel dettaglio e soprattutto giustificare i seguenti valori, vediamo il numero di nodi per ogni dipartimento e capiamo se esiste una relazione con il suo valore di reciprocità.
+
+```{r}
+nodi_dip = nodi %>%
+  group_by(dip) %>%
+  summarise(numero_nodi = n()) %>%
+  arrange(desc(numero_nodi))
+```
+
+
+```{r}
+ggplot(nodi_dip, aes(x = reorder(as.factor(dip), -numero_nodi), y = numero_nodi)) +
+  geom_col(fill = "steelblue") +
+  theme_minimal() +
+  labs(title = "Distribuzione dei Nodi per Dipartimento",
+       subtitle = "Ordinati in modo decrescente",
+       x = "Dipartimento",
+       y = "Num nodi")
+```
+
+Questo grafico a barre mostra in maniera evidente come i vari dipartimenti abbiamo dimensioni molto diverse tra di loro. Sono presenti dipartimenti enormi come il 5 che contiene 109 nodi e il 15 che ne contiene 92, mentre quasi la metà ne abbia meno di 15 (fino ad arrivare a dipartimenti con 3, 2 o addirittura un solo nodo).
+
+Ovviamente questo ci mostra come valori di reciprocità per dipartimenti molto piccoli sono poco robusti visto che il valore può oscillare facilmente tra lo 0 e 1. Un esempio lampante è il dipartimento 26 con un valore di 1 ma che conta solo 6 nodi (senza contare che per dipartimenti con 1 o 2 nodi il valore è sempre 0).
+
+Questi risultati, in generale, ci dicono che la dimensione del dipartimento non sembra limitare la comunicazione e dipartimenti molto grandi non assumono una caratteristica gerarchica.
+
+
+Come ultimo grafico adesso verifico se effettivamente c'è una correlazione tra la diamensione del singolo dipartimento e il suo valore di reciprocità.
+
+```{r}
+# Uniamo i dati
+correlazione_data <- nodi_dip %>%
+  inner_join(recipr_dip, by = "dip")
+
+# Creo lo scatter plot
+ggplot(correlazione_data, aes(x = numero_nodi, y = reciprocità)) +
+  geom_point(color = "steelblue", alpha = 0.7, size = 4) +
+  geom_smooth(method = "lm", color = "red", se = FALSE) + # Linea di tendenza
+  geom_hline(yintercept = 0.7112, linetype = "dotted", color = "black") +
+  geom_text(aes(label = dip), vjust = -1, size = 3, check_overlap = TRUE) +
+  theme_minimal() +
+  labs(
+    title = "Relazione tra dimensione Dipartimento e Reciprocità",
+    subtitle = "dipartimenti grandi = struttura gerarchica?",
+    x = "Num nodi dipartimento",
+    y = "Reciprocità"
+  )
+```
+
+Il grafico mostra come, anche per dipartimenti molto grandi, la comunicazione bi-direzionale rimane pressochè intatta e non si viene a creare una struttura gerarchica.
+
+Per quanto riguarda gli outliers, i diaprtimenti 40 e 25 hanno rispettivamente 3 e 6 nodi quindi il loro valore e poco utile (come anche per il dip 26 che ho citato prima); bisogna tenere d'occhio anche il 28, che conta 10 nodi ma nessuno all'interno comunica in maniera bidirezionale. Questo può significare che, per esempio, questo dipartimento si occupi di comunicazione e faccia parte della segreteria.
+
+I dipartimenti 7 e 24 sono i più particolari: hanno 28 e 27 nodi ma una comunicazione bi-direzionale molto bassa rispetto alla media.
+
+
+Se andiamo infatti a calcolare la percentuale di email che vengono mandate all'interno di questi due dipartimenti, rispetto alla somma totale delle email che vegono mandate dai nodi di quei stessi dipartimenti troviamo il seguente risulato:
+
+```{r}
+comunicazione_esterna = function(d) {
+  nodes_dip = V(g)[dip == d]
+  g_dip = induced_subgraph(g, nodes_dip)
+  
+  #archi interni al dipartimento
+  interni = ecount(g_dip)
+  
+  #tutti gli archi anche quelli che escono dal dipartimento
+  totali_out = sum(degree(g, v = nodes_dip, mode = "out"))
+  
+  #percentuale comunicazione interna
+  comunicazione = interni / max(totali_out, 1)
+}
+
+com_dip = sapply(dipartimenti, comunicazione_esterna)
+
+comunicazione_dip = data.frame(
+  dip = dipartimenti,
+  comunicazione = com_dip
+)
+
+#Prendo i valori in percentuale dei dipartimenti 7 e 24
+res_dip7 = round(comunicazione_dip$comunicazione[comunicazione_dip$dip == 7]* 100, 2)
+res_dip24 = round(comunicazione_dip$comunicazione[comunicazione_dip$dip == 24]* 100, 2)
+
+print(paste("La comunicazione interna del dipartimento 7 è del:", res_dip7, "%"))
+print(paste("La comunicazione interna del dipartimento 24 è del:", res_dip24, "%"))
+
+```
+
+
+Circa l'89% delle email mandata da persone all'interno dei dipartimenti 7 e 24 vanno verso altri dipartimenti. Un 'ulteriore conferma riguardante il ruolo di questi due dipartimenti.
+
+
+Per concludere questa prima analisi andiamo a creare un ultimo grafico:
+
+```{r}
+data_plot = nodi_dip %>%
+  inner_join(comunicazione_dip, by = "dip")
+
+
+ggplot(data_plot, aes(x = numero_nodi, y = comunicazione)) +
+
+  geom_point(color = "steelblue", size = 4, alpha = 0.7) +
+
+  geom_smooth(method = "lm", color = "red", se = FALSE) +
+
+  geom_text(aes(label = dip), vjust = -1.2, size = 3, check_overlap = TRUE) +
+  theme_minimal() +
+  labs(
+    title = "Relazione tra dimesione Dipartimento e tipo Comunicazione",
+    subtitle = "Dipartimenti grandi sono più isolati?",
+    x = "Num nodi dipartimento",
+    y = "comunicazione interna"
+  )
+```
+
+
+Questa visualizzazione ci mostra che dipartimenti più grandi tendono a diventare più isolati. Ci sono più persone all'interno e la comunicazione tende a rimanere dentro al gruppo.
+
+Se ci focalizziamo sugli outliers: 
+
+* il dipartimento 5 (quello con più nodi al suo interno) si trova sotto la linea rossa di tendenza. Essendo il dipartimento più grande può indicare una maggiore comunicazione con il resto della rete e magari ha un ruolo maggiore rispetto a tutti gli altri.
+* i dipartimenti 17 e 18 sono quelli che, anche se in numero minore, comunicano in percentuale di meno rispetto a tutti gli altri.
+* Come già visto i dipartimenti 7 e 24 sono sotto la media.
+
+
+
+# I Capi-dipartimento
+
+La prossima domanda a cui voglio trovare una risposta è se all'interno di ogni dipartimento esistono dei capi-dipartimento che si distinguono dai nodi "normali" per diversi fattori.
+
+Come abbiamo visto in classe ci sono due tipi di nodi centrali:
+
+* **Authority**: è il nodo che riceve informazioni da molti Hub. In questa rete rappresenta la persona di affidamento
+* **Hub**: ci dice dove possiamo trovare informazioni autorevoli. Chi smista il lavoro o dà direttive.
+
+Sappiamo anche che un nodo può essere sia un autorità che un hub. Queste due metriche sono perfette per definire quello che potrebbe essere il capo-reparto per ogni dipartimento della rete.
+
+Per avere maggior confronto e trovare i nodi giusti, calcolo due diverse misure di HITS. La prima locale, quindi calcolo i valori per ogni dipartimento e trovo il capo-reparto prendendo in considerazione solamente i suoi "colleghi". Successivamente farò il calcolo globale; prendere in considerazione l'intera rete mi permette di capire se gli stessi nodi che ho individuato all'inizio sono gli stessi che vengono riconosciuti dall'intera rete.
+
+Una precisazione molto importante riguarda il calcolo locale: per ottenere dei risultati che siano il più possibile veritieri ho deciso di includere nel calcolo solamente quei dipartimenti che hanno almeno 10 nodi al loro interno. In questo modo evito quelle persone che, pur solamente avendo inviato 2 e-mail in un dipartimenti piccolo, vengono classificate come capo-dipartimento. Inoltre penso che una figura di questo rilievo sia importante solamente nel caso in cui bisogna gestire un certo numero di persone.
+
+```{r}
+hits_locale = map_df(dipartimenti, function(d) {
+  nodes_d = V(g)[dip == d]
+  n_nodi = length(nodes_d)
+  
+  #prendo solo dipartimenti con almeno 10 nodi
+  if(n_nodi < 10) return(NULL)
+  
+  g_d = induced_subgraph(g, nodes_d)
+  
+  # Il dipartimento deve avere almeno un arco se no non posso fare calcoli
+  if(ecount(g_d) == 0) {
+    #restituisco quindi 0 se non ci sono archi
+    return(tibble(
+      name = V(g_d)$id,
+      dip = d,
+      auth_loc = 0,
+      hub_loc = 0
+    ))
+  }
+  
+  #calcolo HITS
+  tryCatch({
+    hits_loc <- hits_scores(g_d)
+    
+    tibble(
+      id = V(g_d)$id,
+      dip = rep(d, n_nodi), # ripeto dip per ogni nodo di quel dipartimento
+      authority_locale = round(as.numeric(hits_loc$authority), 2),
+      hub_locale = round(as.numeric(hits_loc$hub), 2)
+    )
+  }, error = function(e) {
+    return(NULL)
+  })
+})
+```
+
+Adesso calcolo le stesse metrica ma questa volta guardo l'intera rete.
+
+```{r}
+hits_total = hits_scores(g)
+hits_globale = data.frame(
+  id = V(g)$id,
+  dip = V(g)$dip,
+  authority_globale = round(hits_total$authority, 2),
+  hub_globale = round(hits_total$hub, 2)
+)
+```
+
+Ora però serve dare una giustificazione ai valori appena trovati e dobbiamo capire al meglio la conformazione di ogni dipartimento. Per aiutarmi ho deciso di calcolare la densità di ogni dipartimento. 
+
+Calcolare la densità di ogni dipartimento mi permette di distinguerli in due possibili categorie:
+
+* **Alta densità**: le due metriche tendono a unificarsi per alcuni nodi e si fa fatica a distiguere un capo-dipartimento rispetto agli altri (potremmo parlare di collaborazione tra più figure di rilievo all'interno di ogni gruppo).
+* **Bassa densità**: i risultati che troviamo sono più affidabili, le metriche di hub e authority sono più "staccate", dove il capo-dipartimento emerge in maniera più evidente rispetto agli altri nodi.
+
+```{r}
+dens_dip = function(d) {
+  nodes_dip = V(g)[dip == d]
+  g_dip = induced_subgraph(g, nodes_dip)
+  #calcolo densità dipartimento
+  dens_dip = edge_density(g_dip, loops = TRUE)
+  
+}
+
+densi_dip = sapply(dipartimenti, dens_dip)
+
+densita_dip = data.frame(
+  dip = dipartimenti,
+  densità = densi_dip
+)
+```
+
+```{r}
+dens_nNodi_dip = densita_dip %>%
+  left_join(nodi_dip, by = "dip")
+```
+
+```{r}
+ggplot(dens_nNodi_dip, aes(x = numero_nodi, y = densità)) +
+  geom_point(color = "steelblue", alpha = 0.6, size = 4) +
+  geom_text(aes(label = dip), vjust = -1.2, size = 3, check_overlap = TRUE) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Relazione Numero Nodi-Densità",
+       x = "nodi nel dipartimento", y = "densità")
+```
+
+Nel grafico si notano subito i dipartimeti 26,13 e 41 dove sono presenti la maggior parte delle possibili comunicazioni; con loro infatti e difficile distinguere una figura di rilievo e per lo più sembrano un dipartimento collaborativo. In linea di massima, all'aumentare del numero di nodi, un dipartimento tende ad avere un valore sempre più basso di densità (c'è da ricordare comunque che per un dipartimento come il 5, una densità del 10% è comunque un segnale di un dipartimento con tante comunicazioni al suo interno).
+
+
+Con la prossima visualizzazione si capisce meglio perchè la densità di un dipartimento è un fattore importante da prendere in considerazione quando si vanno a calcolare metriche come quelle di Hub e Authority.
+
+```{r}
+#Prendo come campione solo i dipartimenti con più di 30 nodi e prendo i casi opposti
+#densità più alta e più bassa
+casi_studio = dens_nNodi_dip %>%
+  filter(numero_nodi > 30) %>%
+  arrange(densità) %>%
+  # Prendiamo i 2 con densità minore e i 2 con densità maggiore
+  filter(row_number() <= 2 | row_number() > (n() - 2)) %>%
+  mutate(tipo_densita = ifelse(densità < median(densità), "Bassa Densità", "Alta Densità"))
+
+#filtro la tabella con i valori di HITS per includere solo i 4 dipartimenti selezionati
+plot_data = hits_locale %>%
+  filter(dip %in% casi_studio$dip) %>%
+  left_join(casi_studio %>% select(dip, tipo_densita), by = "dip")
+
+#plot dei valori di Authority
+ggplot(plot_data, aes(x = as.factor(dip), y = authority_locale, fill = tipo_densita)) +
+  geom_boxplot() +
+  #aggiungo i punti per vedere come si posizionano (specialmente outliers superiori)
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  facet_wrap(~tipo_densita, scales = "free_x") +
+  theme_minimal() +
+  labs(
+    title = "Authority",
+    subtitle = "Dipartimenti con densità opposte (numero_nodi > 30)",
+    x = "id dipartimento",
+    y = "Livello di authority",
+  ) +
+  theme(legend.position = "none")
+```
+
+```{r}
+#faccio lo stesso plot ma in questo caso visualizzo il valore di hub
+
+ggplot(plot_data, aes(x = as.factor(dip), y = hub_locale, fill = tipo_densita)) +
+  geom_boxplot() +
+  # Aggiungiamo i punti (jitter) per vedere la densità dei nodi
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  facet_wrap(~tipo_densita, scales = "free_x") +
+  theme_minimal() +
+  labs(
+    title = "Hub",
+    subtitle = "Dipartimenti con densità opposte (numero_nodi > 30)",
+    x = "id dipartimento",
+    y = "Livello di hub",
+  ) +
+  theme(legend.position = "none")
+```
+
+
+Per dipartimenti grandi che hanno comunque una densità alta (0.33 e 0.38), i valori di Hub e Authority hanno una distribuzione più ampia e una mediana spostata verso l'alto. Gli outliers con i valori più grandi sono vicini tra di loro e verso il valore massimo; indica la possibile presenza di più nodi "dirigenziali" per quel dipartimento.
+
+Caso opposto se andiamo a parlare dei dipartimenti con un valore di densità inferiore (0.10 e 0.12): la mediana è nettamente più bassa, indice che la maggioranza dei nodi ha un valore di Hub e Authority minima. Per quanto riguarda gli outliers in cima notiamo che c'è sempre un nodo isolato rispetto al resto e con un netto taglio dal primo al secondo o terzo nodo per valore. Qua il capo-diaprtimento è facilmente riconoscibile.
+
+
+Ora andiamo a isolare i primi 4 nodi per ogni dipartimento in base al loro valore calcolato con HITS e aggiungiamo il loro valore globale. Facendo questo, per i dipartimenti con alta densità vado a prendere quello che da tutta la rete è considerato più autorevole tra i possibili candidati.
+
+
+```{r}
+hits_totale = hits_locale %>%
+  left_join(hits_globale, by = "id")
+
+possibili_capi_dipartimenti = hits_totale %>%
+  group_by(dip.x) %>%
+  slice_max(order_by = authority_locale, n = 4, with_ties = FALSE) %>%
+  select(dip.x, id, authority_locale, authority_globale)
+
+print(possibili_capi_dipartimenti)
+```
+
+```{r}
+capo_dipartimenti = possibili_capi_dipartimenti %>%
+  group_by(dip.x) %>%
+  slice_max(order_by = authority_globale, n = 1, with_ties = FALSE) %>%
+  select(dip.x, id, authority_locale, authority_globale)
+
+print(capo_dipartimenti)
+```
+
+
+Finalmente ho individuato per ogni diaprtimento il suo "direttore" andando a prendere in considerazione diverse metriche, sia locali che globali, per ottenere dei risultati il più plausibili possibili.
+
+Dai risulstati si nota subito che per i dipartimenti grandi e poco densi, il direttore individuato localmente con i valori di HITS più alti è anche quello con il valore di authority globale più alto. Caso contrario riguarda tutti quei diaprtimenti densi e che hanno un rapporto più collaborativo: in questo caso non viene sempre preso il nodo con il valore locale più alto ma magari il secondo o terzo (per esempio); di fatto qua vado a guardare tra i 4 candidati chi è quello più autorevole se presa in considerazione l'intera rete.
+
+
+# Analisi della sottorete dei capi-dipartimento
+
+Ora che ho individuato chi sono i probabili nodi che si distinguono per ogni dipartimento, vediamo come si presenta la loro sottorete e se possiamo catturare delle caratteristiche interessanti.
+
+```{r}
+id_direttori = capo_dipartimenti$id
+
+g_direttori = induced_subgraph(g, V(g)[id %in% id_direttori])
+
+g_direttori = as_tbl_graph(g_direttori) %>%
+  activate(nodes) %>%
+  left_join(nodi_dip, by = "dip")
+```
+
+## Caratteristiche generali
+
+```{r, fig.width = 10, fig.height = 10, dpi = 300}
+coords = layout_with_fr(g_direttori)
+
+ggraph(g_direttori, layout = coords) +
+  geom_edge_link(alpha = 0.1) +
+  geom_node_point(aes(size = numero_nodi), color = "steelblue") +
+  geom_node_text(aes(label = id), repel = TRUE) +
+  theme_void() +
+  labs(
+    title = "Sottorete dei Capo-Dipartimento",
+    subtitle = "grandezza nodo = numerosità dipartimento"
+  ) +
+  theme(legend.position = "none")
+```
+
+
+Questa sottorete dove catturo le comunicazioni che avvengono tra le figure direttive che ho definito precedentemente ci mostra una struttura ricca di scambi di e-mail tra i diversi nodi. Ci dà in qualche modo conferma che i vari dipartimenti (almeno quelli con 10 o più nodi) non sono isolati ma comunicano tra di loro.
+
+Andiamo più nel dettaglio e cerchiamo di capire meglio alcune caratteristiche.
+
+Prima di tutto andiamo a verificare la densità della rete e mettiamola in confronto con l'intero istituto.
+
+```{r}
+print(paste("La sottorete ha una densità di:", round(edge_density(g_direttori, loops = TRUE), 4)))
+print(paste("La rete completa ha una densità di:", round(edge_density(g_noSelf, loops = TRUE), 4)))
+```
+
+Mentre la rete completa dell'istutito è molto sparsa (densità di 0.0253), la rete dei soli capo-dipartimento è addirittura 20 volte più densa con un valore di 0.4362. Questi nodi sono molto interconnessi tra di loro e le informazioni circolano molto velocemente.
+
+Un comportamento del genere è abbastanza prevedibile se si pensa al ruolo che ricoprono questi nodi: essendo figure importanti per il loro dipartimento sono anche quelle persone chiave che permettono lo scambio (in questo caso di e-mail) tra diversi dipartimenti. Inoltre per questioni amministrative, politiche o economiche sono quelli che devono mettersi d'accordo e avere un rapporto per coordinarsi in maniera ottimale per il bene del loro istituto.
+
+
+A livello di assortatività cerchiamo di vedere come si comporta la rete.
+
+```{r}
+Agrado = assortativity_degree(g_direttori, directed = TRUE)
+AgradoTot = assortativity_degree(g, directed = TRUE)
+
+print(paste("Assortatività per grado dei nodi della sottorete:", Agrado))
+print(paste("Assortatività per grado dei nodi rete totale:", AgradoTot))
+```
+
+La rete globale ha un assortatività neutra quindi anche nodi di alto grado parlano con nodi di basso grado in maniera indifferente. Questo rispecchia appieno la natura della rete: i capo-reparto devono comunicare in maniera indifferente sia con le persone del suo dipartimento (e quindi anche nodi di basso grado) che con gli altri direttori.
+
+Per quanto riguarda la sottorete invece, la possiamo definire disassortativa. Questo valore ci dice che nodi di alto grado tendono a collegarsi con nodi di grado minore. Potrebbe significare che i nodi più centrali fungono da ponte per quelli più periferici (persone che sono più centrali hanno il compito di inviare le comunicazioni importanti anche ai dipartimenti con direttori periferici). 
+
+## Individuare un possibile direttore generale
+
+Vado adesso a calcolare diverse metriche per capire se è presente o meno una figura di rilievo all'interno di questa sottorete.
+
+```{r}
+hits_direttori = hits_scores(g_direttori)
+
+statistiche_direttori = g_direttori %>%
+  activate(nodes) %>%
+  mutate(
+    grado_totale = centrality_degree(mode = "total"),
+    grado_in = centrality_degree(mode = "in"),
+    grado_out = centrality_degree(mode = "out"),
+    pagerank = centrality_pagerank(),
+    authority = hits_direttori$authority,
+    hub = hits_direttori$hub
+  ) %>%
+  as_tibble()
+```
+
+
+```{r}
+ggplot(statistiche_direttori, aes(x = grado_out, y = grado_in)) +
+  geom_point(aes(size = numero_nodi), color = "steelblue", alpha = 0.7) +
+  geom_text_repel(aes(label = id), size = 3) +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  theme_minimal() +
+  labs(
+    title = "In-Degree vs Out-Degree",
+    x = "Out-Degree",
+    y = "In-Degree",
+    size = "Dim. Dipartimento"
+  )
+```
+
+Da questo primo grafo individuiamo i nodi 435 e 108 come quelli con in e out degree maggiore. Ma prima di trarre conclusioni affrettate andiamo a considerare anche le altre metriche:
+
+```{r}
+Hits_boxplot = statistiche_direttori %>%
+  pivot_longer(cols = c(authority, hub), 
+               names_to = "Metrica", 
+               values_to = "Valore")
+
+#boxplot
+ggplot(Hits_boxplot, aes(x = Metrica, y = Valore, fill = Metrica)) +
+
+  geom_boxplot(alpha = 0.4, outlier.shape = NA, color = "black") +
+  
+  # aggiungiamo i punti per evidenziare gli outliers
+  geom_jitter(width = 0.15, alpha = 0.6) +
+  
+  # Etichetto solo chi supera un valore di 0.7
+  geom_text_repel(data = subset(Hits_boxplot, Valore > 0.75),
+                  aes(label = id),
+                  size = 3.5,
+                  fontface = "bold") +
+  
+  theme_minimal() +
+  labs(title = "Analisi Outlier: Authority vs Hub",
+       y = "valore",
+       x = "") +
+  scale_fill_manual(values = c("authority" = "red", "hub" = "blue")) +
+  theme(legend.position = "none")
+```
+
+Visualizzando Hub e Authority scopriamo che anche qua c'è una differenza netta tra i nodi 435 e 108. Il primo si evidenzia per il suo valore di authority mentre il secondo per il suo valore di Hub
+
+
+```{r, fig.width = 10, fig.height = 10, dpi = 300}
+df_viz = statistiche_direttori %>%
+  select(id, grado_totale, pagerank, authority, hub) %>%
+  mutate(across(-id, ~ rescale(.))) %>%
+  pivot_longer(cols = -id, names_to = "Metrica", values_to = "Valore")
+
+# Grafico lollypop con le 4 diverse metriche
+ggplot(df_viz, aes(x = Valore, y = reorder_within(id, Valore, Metrica))) +
+  geom_segment(aes(x = 0, xend = Valore, yend = reorder_within(id, Valore, Metrica)), color = "lightgrey") +
+  geom_point(aes(color = Metrica), size = 3) +
+  scale_y_reordered() +
+  facet_wrap(~ Metrica, scales = "free_y") +
+  theme_minimal() +
+  labs(
+    title = "Confronto diverse metriche di centralità dei Capo-Dipartimenti",
+    subtitle = "Valori normalizzati",
+    x = "valore",
+    y = "id"
+  ) +
+  theme(legend.position = "none", axis.text.y = element_text(size = 8))
+```
+
+Avendo una visione di insieme continuiamo a vedere i gli stessi due nodi come figure autorevoli all'interno della nostra sottorete.
+
+
+Visto il valore alto di densità di questa sottorete e i risultati appena riportati, possiamo definire i nodi 108 e 435 come figure di rilievo. Se andiamo a ricontrollare poi, i loro valori di authority e hub globali calcolati precedentemente, scorpiamo che si trovano rispettivamente in posizione 2 e 4.
+
+Oltre ad essere figure riconosciute a livello "dirigenziale", sono anche importanti per quanto riguarda la rete completa
+
+```{r}
+V(g)$betweenness = round(betweenness(g, directed = TRUE, normalized = TRUE), 4)
+
+# classifica betweeness
+classifica_bet = data.frame(
+    id = V(g)$id,
+    betweenness = V(g)$betweenness
+  ) %>%
+  arrange(desc(betweenness)) %>%
+  mutate(rank = row_number())
+
+# prendo i due direttori generali
+nodi_target_bet = classifica_bet %>% 
+  filter(id %in% c("108", "435"))
+
+print(nodi_target_bet)
+```
+
+```{r}
+V(g)$closeness = round(closeness(g, normalized = TRUE), 4)
+
+# classifica closeness
+classifica_close = data.frame(
+    id = V(g)$id,
+    closeness = V(g)$closeness
+  ) %>%
+  arrange(desc(closeness)) %>%
+  mutate(rank = row_number())
+
+# prendo i due direttori generali
+nodi_target_close = classifica_close %>% 
+  filter(id %in% c("108", "435"))
+
+print(nodi_target_close)
+```
+
+
+**Betweeness**: gran parte delle comunicazioni che abbiamo tra diversi dipartimenti passa per i nodi 108 e 435
+
+**Closeness**: i due nodi si trovano a pochi salti dal resto dei nodi nella rete. Riescono a mandare e-mail a tutti i dipartimenti, in particolar modo a tutti i nodi, più velocemente di quasi tutte le altre persone.
+
+Di solito avere una metrica globale di closeness alta significa assumere un ruolo dirigenziale importante ed è anche per questo che molto probabilmente fanno parte della **Direzione generale** dell'istituto.
+
+
+## Dipartimento grande = Ruolo importante?
+
+Non abbiamo preso in considerazione un fattore importante: essere a capo di un dipartimento grande è una variabile che mi rende "importante" per gli altri direttori?
+
+```{r}
+metriche = c("grado_totale", "grado_in", "grado_out", "pagerank", "authority", "hub")
+
+risultati_test = map_df(metriche, function(m) {
+  test = cor.test(statistiche_direttori$numero_nodi, statistiche_direttori[[m]], method = "spearman")
+  tibble(
+    metrica = m,
+    Rho = round(test$estimate, 3),
+    p_Value = round(test$p.value, 4),
+    significativo = ifelse(test$p.value < 0.05, "sì", "no")
+  )
+})
+print(risultati_test)
+```
+
+I test ci mostrano che essere a capo di un dipartimento grande non influisce per quanto riguarda le diverse metriche calcolate.
+
+
+## Analisi K_Core
+
+
+```{r}
+g_core = g %>%
+  activate(nodes) %>%
+  mutate(
+    K_core = node_coreness(mode = "all")
+  ) %>%
+  as_tibble()
+max_K_core = max(g_core$K_core)
+```
+
+```{r}
+nodi_K_max = V(g)$id[g_core$K_core == max_K_core]
+print(nodi_K_max)
+```
+
+```{r}
+all(id_direttori %in% nodi_K_max)
+
+not_in_core = setdiff(id_direttori, nodi_K_max)
+not_in_core
+```
+
+
+Dopo aver trovato il gruppo di nodi appartenenti al K_Core più grande, ho cercato di capire se i nodi appartenenti al sottografo dei direttori di dipartimento fanno parte di questo gruppo coeso. Solamente 3 nodi non fanno parte di questo gruppo. Quei direttori magari non sono "attivi" nella comunicazione interna riguardante quella che potrebbe essere l'area amministrativa dell'istituto, fanno parte di dipartimenti periferici o molto isolati e quindi meno integrati nel flusso centrale di comunicazione.
+
+# Conclusioni
+
+## Cosa sappiamo adesso
+
+
+L'analisi dettagliata di questa rete mi ha permesso di catturare alcuni aspetti specifici.
+
+* La distribuzione dei gradi segue in modo approssimativo la distribuzione Power-Law.
+* La rete è Scale-Free, è robusta ai fallimenti ma debole per quanto riguarda gli attacchi mirati.
+* Segue le proprietà che abbiamo definito per una rete Small-World: un coefficiente di clustering alto con un cammino medio corto.
+* I dipartimenti sono molto coesi e la comunicazione è per lo più bi-direzionale.
+* Si possono distinguere dei Direttori per ogni dipartimento
+* I Direttori hanno una rete di comunicazione densa e si possono distinguere due figure di rilievo tra di loro
+
+Queste sono tutte caratteristiche che rispecchiano a pieno una rete sociale ampia e complessa, dove le informazioni raggiungono tutta la rete in poco tempo. 

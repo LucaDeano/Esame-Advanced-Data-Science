@@ -1,0 +1,10 @@
+/* scrolling */
+slides > slide {
+  background: white;
+  overflow-x: auto !important;
+  overflow-y: auto !important;
+}
+
+slides > slide:not(.nobackground):after {
+  content: none;
+}
